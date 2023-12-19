@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+
+# -----------------------------------------------------------------
+# This program shows the cgroup controllers cpu, cpuset, memory and
+# (blk)io with the processes connected to those cgroups.
+#
+# Author: Gerlof Langeveld
+#         gerlof@atcomputing.nl
+#         AT Computing - Velp, The Netherlands
+#
+# Date:   Februar 2022 		Cgroups v1
+# Date:   June    2022 		Cgroups v2
+# -----------------------------------------------------------------
+# This file is free software.  You can redistribute it and/or modify
+# it under the terms of the GNU General Public License (GPL); either
+# version 3, or (at your option) any later version.
+#
+import os
+import sys
+import glob
+import argparse
+
+# -----------------------------------------------------------------
+# Generic variables (v1 and v2)
+#
+BASEDIR     = '/sys/fs/cgroup'		# base directory of cgroups
+CGPIDS      = 'cgroup.procs'		# 'file' containing PIDs of cgroup
+MEMINFINITE = "9223372036854771712"
+
+PRCOLS      = 80			# default line length
+PRHEAD      = "CONTROLLER %-6s "	# controller header
+PRINDENT    = "    "			# indentation per cgroup level
+PRCOLONH    = "\33[01;31m\33[K"		# header  color switch on
+PRCOLOND    = "\33[01;34m\33[K"		# detail  color switch on
+PRCOLOFF    = "\33[m\33[K"		# generic color switch off
+
+
+# -----------------------------------------------------------------
+# V1 specific variables
+#
+V1BASELEVEL = BASEDIR.count('/')+2	# components in base directory
+
+V1CPULINEH    = '%s%s %7s %8s %9s%s'
+V1CPULINED    = '%s%s%-*s %7s %7.2f%% %9s%s'
+V1CPUSHARES   = 'cpu.shares'
+V1CPUQUOTA    = 'cpu.cfs_quota_us'
+V1CPUPERIOD   = 'cpu.cfs_period_us'
+
+V1CPSLINE     = '%s%s%-*s %9s %8s%s'
+V1CPSCPUSET   = 'cpuset.cpus'
+V1CPSMEMSET   = 'cpuset.mems'
+
+V1MEMLINE     = '%s%s%-*s %9s %8s%s'
+V1MEMUSAGE    = "memory.usage_in_bytes"
+V1MEMLIMIT    = "memory.limit_in_bytes"
+
+V1BIOLINE     = '%s%s%-*s %9s %s'
+V1BIOWEIGHT   = "blkio.weight"
+
+# -----------------------------------------------------------------
+# V2 specific variables
+#
+V2BASELEVEL   = BASEDIR.count('/')+1	 # components in base directory
+V2CGACTIVEC   = 'cgroup.subtree_control' # 'file' containing active controllers
+
+V2CPULINE     = '%s%s%-*s %6s %9s %9s%s'
+V2CPUMAX      = 'cpu.max'
+V2CPUW8       = 'cpu.weight'
+V2CPUW8NICE   = 'cpu.weight.nice'
+
+V2CPSLINE     = '%s%s%-*s %11s %11s%s'
+V2CPSCPUSET   = 'cpuset.cpus.effective'
+V2CPSMEMSET   = 'cpuset.mems.effective'
+
+V2MEMLINE     = '%s%s%-*s %8s %8s %8s %8s %8s%s'
+V2MEMCUR      = "memory.current"
+V2MEMMAX      = "memory.max"
+V2MEMMIN      = "memory.min"
+V2SWPCUR      = "memory.swap.current"
+V2SWPMAX      = "memory.swap.max"
+
+V2IOLINE      = '%s%s%-*s %5s/%s%s'
+V2IOMAX       = "io.max"
+V2IOLATENCY   = "io.latency"
+
+# --------------------------------------------------------------------------
+# M A I N   when cgroups v1 in use
+# --------------------------------------------------------------------------
+def v1_main(controllers):
+    global PRCOLS, PRHEAD
+
+    # handle all directories of the relevant controllers
+    # till maximum depth is reached (if specified by flag)
+    #
+    for cgname, cgfunc in V1CONTROLFUNCS.items():
+        # is this controller wanted?
+        #
+        if ARGS.controller and cgname not in ARGS.controller:
+            continue
+
+        # store all subdirectories for a controller in a list
+        #
+        cgsubdirs = []
+
+        for level in range(ARGS.depth):
+            taskspaths = glob.glob("%s/%s%s/%s" %
+                                (BASEDIR, cgname, level*"/*", CGPIDS))
+
+            if not taskspaths:	# deepest level reached?
+                break
+
+            # verify if group in use and strip basename from path
+            for tasksfile in taskspaths:
+                cgsubdirs.append(tasksfile[:-len(CGPIDS)-1])
+
+        # handle subdirectories in a controller-specific way
+        #
+        if cgsubdirs:
+            cgsubdirs.sort()
+            cgfunc(PRHEAD%cgname, cgsubdirs)
+
+
+# --------------------------------------------------------------------------
+# handle cpu controller (v1)
+# --------------------------------------------------------------------------
+def v1_do_cpu(title, cgsubdirs):
+    # calculate percentages
+    #
+    percent = cpucalcperc(cgsubdirs)
+
+    # print header line
+    #
+    prlinelen = PRCOLS - 28
+
+    print(V1CPULINEH % (
+               PRCOLONH, title[:prlinelen],
+               "SHARES", "MINIMUM", "MAXIMUM", PRCOLOFF))
+
+    # print every cgroup in cpuset controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        #
+        parts  = subdir.split('/')
+        cgroup = parts[-1]
+        level  = len(parts) - V1BASELEVEL
+
+        # shorten the CID of Docker containers
+        #
+        if not cgroup.strip('0123456789abcdef'):
+            cgroup = cgroup[:12]
+
+        # get shares
+        #
+        shares, *rest = readlines("%s/%s" % (subdir, V1CPUSHARES))
+
+        # get quota-related period
+        #
+        period, *rest = readlines("%s/%s" % (subdir, V1CPUPERIOD))
+
+        # get quota
+        #
+        quota, *rest  = readlines("%s/%s" % (subdir, V1CPUQUOTA))
+
+        if int(quota) == -1:
+            maximsg = 'infinite'
+        else:
+            maximsg = '%7.1f%%' % (100*int(quota)/int(period))
+
+        # determine the indentation level of this cgroup
+        #
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        #
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        #
+        print(V1CPULINED %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 shares, percent[subdir], maximsg, PRCOLOFF))
+
+        # print all related processes
+        #
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle cpuset controller (v1)
+# --------------------------------------------------------------------------
+def v1_do_cpuset(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 21
+
+    print(V1CPSLINE %
+              ("", PRCOLONH, prlinelen, title[:prlinelen],
+               "CPUS", "MEMS", PRCOLOFF))
+
+    # print every cgroup in cpuset controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        cgroup = parts[-1]
+        level  = len(parts) - V1BASELEVEL
+
+        # shorten the CID of Docker containers
+        if not cgroup.strip('0123456789abcdef'):
+            cgroup = cgroup[:12]
+
+        # get cpuset and memory set
+        cpus, *rest = readlines("%s/%s" % (subdir, V1CPSCPUSET))
+        mems, *rest = readlines("%s/%s" % (subdir, V1CPSMEMSET))
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V1CPSLINE % (strindent, PRCOLOND, prlinelen-lenindent,
+                         cgroup, cpus, mems, PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle memory controller (v1)
+# --------------------------------------------------------------------------
+def v1_do_memory(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 21
+
+    print(V1MEMLINE %
+               ("", PRCOLONH, prlinelen, title[:prlinelen],
+                "MEMLIMIT", "MEMUSAGE", PRCOLOFF))
+
+    # print every cgroup in memory controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        cgroup = parts[-1]
+        level  = len(parts) - V1BASELEVEL
+
+        # shorten the CID of Docker containers
+        if not cgroup.strip('0123456789abcdef'):
+            cgroup = cgroup[:12]
+
+        # get memory limit and usage of this cgroup
+        memlimit, *rest = readlines("%s/%s" % (subdir, V1MEMLIMIT))
+        memusage, *rest = readlines("%s/%s" % (subdir, V1MEMUSAGE))
+
+        if not int(memusage):	# unused cgroup?
+            continue
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V1MEMLINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 convertmem(memlimit),
+                 convertmem(memusage), PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle blkio controller (v1)
+# --------------------------------------------------------------------------
+def v1_do_blkio(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 12
+
+    print(V1BIOLINE % 
+               ("", PRCOLONH, prlinelen, title[:prlinelen],
+               "BIOWEIGHT", PRCOLOFF))
+
+    # print every cgroup in blkio controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        cgroup = parts[-1]
+        level  = len(parts) - V1BASELEVEL
+
+        # shorten the CID of Docker containers
+        if not cgroup.strip('0123456789abcdef'):
+            cgroup = cgroup[:12]
+
+        # get blkio weight 
+        try:
+            bioweight, *rest = readlines("%s/%s" % (subdir, V1BIOWEIGHT))
+        except Exception:
+            print("blkio weight can not be determined!\n", file=sys.stderr)
+            return
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V1BIOLINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 bioweight, PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# M A I N   when cgroups v2 in use
+# --------------------------------------------------------------------------
+def v2_main(controllers):
+    # store all subdirectories (i.e. the different groups) in a list
+    #
+    cgsubdirs = []
+
+    for level in range(ARGS.depth+1):
+        taskspaths = glob.glob("%s%s/%s" % (BASEDIR, level*"/*", CGPIDS))
+
+        if not taskspaths:	# deepest level reached?
+            break
+
+        # verify if group is empty and strip basename from path
+        #
+        for tasksfile in taskspaths:
+            cgsubdirs.append(tasksfile[:-len(CGPIDS)-1])
+
+    # handle controller-specific info from subdirectories
+    #
+    if cgsubdirs:
+        cgsubdirs.sort()
+
+    # handle all directories by the relevant controllers
+    #
+    for cgname, cgfunc in V2CONTROLFUNCS.items():
+        # is this controller wanted?
+        #
+        if ARGS.controller and cgname not in ARGS.controller:
+            continue
+
+        if cgname not in controllers:
+            continue
+
+        # print info about controller
+        #
+        cgfunc(PRHEAD%cgname, cgsubdirs)
+
+
+# --------------------------------------------------------------------------
+# handle cpu controller (v2)
+# --------------------------------------------------------------------------
+def v2_do_cpu(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 28
+
+    print(V2CPULINE %
+               ("", PRCOLONH, prlinelen, title[:prlinelen],
+                "CPUMAX", "CPUWEIGHT", "CPUW8NICE", PRCOLOFF))
+
+    # print every cgroup in memory controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        level  = len(parts) - V2BASELEVEL
+
+        if level == 0:
+            cgroup = 'root'
+        else:
+            cgroup = parts[-1]
+
+        # get cpu values of this cgroup
+        try:
+            cpumax, cpuscale, *rest = readline("%s/%s" % (subdir, V2CPUMAX))
+        except Exception:
+            cpumax   = "-"
+            cpuscale = "-"
+
+        try:
+            cpuw8, *rest = readline("%s/%s" % (subdir, V2CPUW8))
+        except Exception:
+            cpuw8 = "-"
+
+        try:
+            cpuw8n, *rest = readline("%s/%s" % (subdir, V2CPUW8NICE))
+        except Exception:
+            cpuw8n = "-"
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # calculate max as percentage
+        if cpumax == "max":
+            perc = "100.0%"
+        elif cpumax == "-" or cpuscale == "-":
+            perc = "-"
+        else:
+            perc = "%5.1f%%" % (float(cpumax) * 100.0 / float(cpuscale))
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V2CPULINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 perc, cpuw8, cpuw8n, PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle cpuset controller (v2)
+# --------------------------------------------------------------------------
+def v2_do_cpuset(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 26
+
+    print(V2CPSLINE %
+              ("", PRCOLONH, prlinelen, title[:prlinelen],
+               "CPUS", "MEMS", PRCOLOFF))
+
+    # print every cgroup in memory controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        level  = len(parts) - V2BASELEVEL
+
+        if level == 0:
+            cgroup = 'root'
+        else:
+            cgroup = parts[-1]
+
+        # get cpuset and memory set
+        try:
+            cpus, *rest = readlines("%s/%s" % (subdir, V2CPSCPUSET))
+        except Exception:
+            cpus = "-"
+
+        try:
+            mems, *rest = readlines("%s/%s" % (subdir, V2CPSMEMSET))
+        except Exception:
+            mems = "-"
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V2CPSLINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 cpus, mems, PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle memory controller (v2)
+# --------------------------------------------------------------------------
+def v2_do_memory(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = PRCOLS - 46
+
+    print(V2MEMLINE %
+               ("", PRCOLONH, prlinelen, title[:prlinelen],
+                "MEMUSAGE", "MEMMAX", "MEMMIN",
+                "SWPUSAGE", "SWAPMAX", PRCOLOFF))
+
+    # print every cgroup in memory controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        level  = len(parts) - V2BASELEVEL
+
+        if level == 0:
+            cgroup = 'root'
+        else:
+            cgroup = parts[-1]
+
+        # shorten the CID of Docker containers
+        if not cgroup.strip('0123456789abcdef'):
+            cgroup = cgroup[:12]
+
+        # get memory values of this cgroup
+        try:
+            memcur, *rest = readline("%s/%s" % (subdir, V2MEMCUR))
+        except Exception:
+            memcur = "-"
+
+        try:
+            memmax, *rest = readline("%s/%s" % (subdir, V2MEMMAX))
+        except Exception:
+            memmax = "-"
+
+        try:
+            memmin, *rest = readline("%s/%s" % (subdir, V2MEMMIN))
+        except Exception:
+            memmin = "-"
+
+        try:
+            swpcur, *rest = readline("%s/%s" % (subdir, V2SWPCUR))
+        except Exception:
+            swpcur = "-"
+
+        try:
+            swpmax, *rest = readline("%s/%s" % (subdir, V2SWPMAX))
+        except Exception:
+            swpmax = "-"
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V2MEMLINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 convertmem(memcur), convertmem(memmax), convertmem(memmin),
+                 convertmem(swpcur), convertmem(swpmax), PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+# --------------------------------------------------------------------------
+# handle io controller (v2)
+# --------------------------------------------------------------------------
+def v2_do_io(title, cgsubdirs):
+    # print header line
+    #
+    prlinelen = 45
+
+    print(V2IOLINE %
+              ("", PRCOLONH, prlinelen, title[:prlinelen],
+               "IOMAX", "IOLATENCY", PRCOLOFF))
+
+    # print every cgroup in memory controller
+    #
+    for subdir in cgsubdirs:
+        # split pathname into parts
+        parts  = subdir.split('/')
+        level  = len(parts) - V2BASELEVEL
+
+        if level == 0:
+            cgroup = 'root'
+        else:
+            cgroup = parts[-1]
+
+        # get IO values
+        try:
+            iomax, *rest = readlines("%s/%s" % (subdir, V2IOMAX))
+        except Exception:
+            iomax = "-"
+
+        try:
+            iolat, *rest = readlines("%s/%s" % (subdir, V2IOLATENCY))
+        except Exception:
+            iolat = "-"
+
+        # determine the indentation level of this cgroup
+        strindent = level * PRINDENT
+        lenindent = level * len(PRINDENT)
+
+        # shorten cgroup names to printable maximum
+        cgroup = cgroup[:prlinelen-lenindent]
+
+        # print cgroup values
+        print(V2IOLINE %
+                (strindent, PRCOLOND, prlinelen-lenindent, cgroup,
+                 iomax, iolat, PRCOLOFF))
+
+        # print all related processes
+        printprocs(subdir, strindent, prlinelen-lenindent)
+
+    print()
+
+
+
+# --------------------------------------------------------------------------
+# print lines with process information (PID and command line)
+# of all processes in specified cgroup subdirectory
+# --------------------------------------------------------------------------
+def printprocs(subdir, strindent, cmdlen):
+    # --pids-show flag not used?
+    #
+    if not ARGS.pids_show:
+        return
+
+    # get all pids related to this cgroup
+    #
+    pids = readlines("%s/%s" % (subdir, CGPIDS))
+
+    # print the PID and command line of each related process
+    #
+    maxsize = cmdlen - len(strindent) - 11
+
+    for pid in pids:
+        print("%sCMD: %7s %s" % (strindent, pid, getcmd(pid)[:maxsize]))
+
+    print()
+ 
+
+# --------------------------------------------------------------------------
+# return a list with all lines read from the given file
+# --------------------------------------------------------------------------
+def readlines(filename):
+    try:
+        with open(filename) as f:
+            all = f.readlines()
+    except Exception as exc:
+        all = []
+
+    all = list( map(lambda x:x.strip(), all))
+    return all
+
+
+# --------------------------------------------------------------------------
+# return a list with all fields read from the first line of the given file
+# --------------------------------------------------------------------------
+def readline(filename):
+    try:
+        with open(filename) as f:
+            all = f.readline().split()
+    except Exception as exc:
+        all = []
+
+    all = list( map(lambda x:x.strip(), all))
+    return all
+
+
+# --------------------------------------------------------------------------
+# return the command (line) related to the given pid
+# --------------------------------------------------------------------------
+def getcmd(pid):
+    # open /proc/PID/cmdline
+    #
+    try:
+        t = open("/proc/%s/cmdline" % pid)
+    except Exception:
+        return "?"
+
+    # read command line containing null bytes between arguments
+    # (replace by spaces)
+    #
+    cmd = t.readline().replace('\0', ' ').strip()
+    t.close()
+
+    if cmd:
+        return cmd
+
+    # for kernel processes, the cmdline is empty, so
+    # open /proc/PID/status file to get the process name
+    try:
+        t = open("/proc/%s/status" % pid)
+    except Exception:
+        return "?"
+
+    for line in t:
+        label, cmd = line.split(maxsplit=2)
+
+        if label == "Name:":
+            break
+
+    t.close()
+
+    return '[' + cmd + ']'	# surround kernel process by [...]
+
+
+# --------------------------------------------------------------------------
+# convert string with number of bytes
+# into human-readable string based on logical unit
+# --------------------------------------------------------------------------
+def convertmem(numbytes):
+    if numbytes == MEMINFINITE:
+        return "infinite"
+
+    if numbytes == "-" or numbytes == "max":
+        return numbytes
+
+    length = len(numbytes)
+    """
+    elif length < 7:
+         return "%.3fK" % (int(numbytes) / 1024.0)
+    """
+    if length < 10:
+         return "%.3fM" % (int(numbytes) / 1024 / 1024.0)
+
+    elif length < 13:
+         return "%.3fG" % (int(numbytes) / 1024 / 1024 / 1024.0)
+
+    elif length < 16:
+         return "%.3fT" % (int(numbytes) / 1024 / 1024 / 1024 / 1024.0)
+
+    else:
+         return "%.3fP" % (int(numbytes) / 1024 / 1024 / 1024 / 1024 / 1024.0)
+
+
+# --------------------------------------------------------------------------
+# calcute per directory of the cpu controller which share of the
+# system-wide CPU capacity is garanteed per cgroup
+# --------------------------------------------------------------------------
+def cpucalcperc(cgsubdirs):
+    dirtree = {}
+    sysperc = {}
+
+    # build tree dictionary with directory as key and a list 
+    # containing the subdirectories right below as value
+    #
+    for subdir in cgsubdirs:
+        cs = subdir.count('/')
+
+        for existdir in dirtree:
+            ps = existdir.count('/')
+
+            if subdir.startswith(existdir) and cs == ps+1:
+                dirtree[existdir].append(subdir)
+
+        dirtree[subdir] = []
+
+    # build other dictionary with directory as key and a percentage
+    # of garanteed CPU capacity on system level as value
+    #
+    sysperc[sorted(dirtree)[0]] = 100		# initially 100% for top directory
+
+    for dir in sorted(dirtree):
+        # calculate total shares for directory and
+        # underlying subdirectories
+        #
+        totshares = 1024 			# fixed shares for top directory
+
+        for subdir in dirtree[dir]:
+            shares, *rest    = readlines("%s/%s" % (subdir, V1CPUSHARES))
+            sysperc[subdir]  = int(shares)	# temporarily store shares
+            totshares       += sysperc[subdir]
+
+        # total shares is known
+        # calculate percentage for each subdirectory and
+        # finally for the topdirectory
+        #
+        for subdir in dirtree[dir]:		# permanently store percentage
+            sysperc[subdir] = sysperc[dir] / (totshares/sysperc[subdir])
+
+        sysperc[dir] = sysperc[dir] / (totshares/1024) # permanently store percentage
+
+    return sysperc
+
+
+# --------------------------------------------------------------------------
+# dict with controllers and related handling functions per version
+#
+V1CONTROLFUNCS = {
+    'cpu':    v1_do_cpu,
+    'cpuset': v1_do_cpuset,
+    'memory': v1_do_memory,
+    'blkio':  v1_do_blkio
+}
+
+V2CONTROLFUNCS = {
+    'cpu':    v2_do_cpu,
+    'cpuset': v2_do_cpuset,
+    'memory': v2_do_memory,
+    'io':     v2_do_io
+}
+
+# determine if version 1 or version 2 is in use
+#
+try:
+    with open(BASEDIR+'/'+V2CGACTIVEC) as f:
+        MAINFUNC    = v2_main
+        controllers = list(set(f.readline().split()) & set(V2CONTROLFUNCS))
+except Exception as exc:
+    MAINFUNC    = v1_main
+    controllers = list(V1CONTROLFUNCS)
+
+# verify command line arguments
+#
+myparser = argparse.ArgumentParser()
+myparser.add_argument('-d', '--depth', action='store', type=int,
+                            help="maximum depth", default=999)
+myparser.add_argument('-p', '--pids-show', action='store_true',
+                            help="show processes per cgroup")
+myparser.add_argument('-n', '--no-colors',     action='store_true',
+                            help="do not use colors")
+myparser.add_argument('controller',            action='store', nargs='*',
+                            help=", ".join(controllers)+" (default: all)")
+
+ARGS = myparser.parse_args()
+
+# no colors if not connected to tty or colors not wanted
+#
+if not sys.stdout.isatty() or ARGS.no_colors:
+    PRCOLONH = ""
+    PRCOLOND = ""
+    PRCOLOFF = ""
+
+# prepare print information
+#
+if sys.stdout.isatty():
+    PRCOLS, lines = os.get_terminal_size()
+
+PRHEAD += PRCOLS * '-'
+ 
+MAINFUNC(controllers)	# call proper main function
