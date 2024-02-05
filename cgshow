@@ -341,7 +341,7 @@ def v2_main(controllers):
     #
     cgsubdirs = []
 
-    for level in range(ARGS.depth+1):
+    for level in range(ARGS.depth):
         taskspaths = glob.glob("%s%s/%s" % (BASEDIR, level*"/*", CGPIDS))
 
         if not taskspaths:	# deepest level reached?
